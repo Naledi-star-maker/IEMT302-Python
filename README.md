@@ -1,8 +1,8 @@
 # Public Funds Transparency Simulator
 
-**Can a shared digital record make it harder to quietly rewrite the history of public spending? Try to cheat it and find out.**
+**Can a shared digital record make it harder to quietly rewrite the history of public spending? This project attacks its own ledger thousands of times, measures what gets caught, and compares it with a plain database.**
 
-A proof-of-concept built for **IEMT302 Emerging Technology** (Nelson Mandela University). It follows a fictional **R500 million hospital project** from budget to contractor to suppliers, writes every step into a hash-linked ledger, and then lets you attack that ledger to see what gets caught and what slips through.
+A proof-of-concept built for **IEMT302 Emerging Technology** (Nelson Mandela University). It follows a fictional **R500 million hospital project** from budget to contractor to suppliers, writes every step into a hash-linked ledger, and then tests that ledger two ways: short scripted **demonstrations** that explain how each safeguard works, and a **systematic test** in which a program, not a person, chooses the attacks.
 
 > Everything here is fictional: the organisations, the project, the money and the documents. This is a teaching demo, not a government system, and **not a real blockchain network**.
 
@@ -10,11 +10,9 @@ A proof-of-concept built for **IEMT302 Emerging Technology** (Nelson Mandela Uni
 
 ## Why this exists
 
-When public money is spent, how can ordinary people check that the *record* of that spending hasn't been changed after the fact? Today we mostly rely on an institution's own word, or on audits that happen long after the money is gone.
+When public money is spent, how can ordinary people check that the *record* of that spending has not been changed after the fact? Today we mostly rely on an institution's own word, or on audits that happen long after the money is gone.
 
-Blockchain-style ledgers are often pitched as the fix. This project tests that claim honestly, on a small scale, and reports the weak spots as well as the strengths.
-
-**The headline finding:** a hash-linked ledger can show that a record was *changed*. It cannot show that a record was *true*.
+Blockchain-style ledgers are often pitched as the fix. This project tests that claim on a small scale and reports the weak spots as well as the strengths, including a head-to-head against a plain database.
 
 ---
 
@@ -44,8 +42,6 @@ National Treasury  --R500m allocated-->  Public Works Department
                               Steel Supplier         Labour Services
 ```
 
-Three details worth noticing:
-
 - The **award is a promise to pay**, not a payment. Only the R150m of PAYMENT blocks is government money actually released.
 - Supplier and labour transfers are the **contractor spending its own received money**, not extra government spending.
 - **R20m** was allocated but never awarded, and no record explains it. The ledger shows the gap; it cannot say why.
@@ -54,93 +50,126 @@ Three details worth noticing:
 
 ## Running it
 
-**Requirements:** Python 3.9+. Standard library only. Tkinter is needed for the window (it ships with most Python installs).
+**Requirements:** Python 3.9+. Standard library only. Tkinter is needed for the window (it ships with most Python installs; on Ubuntu/Debian: `sudo apt install python3-tk`).
 
 ```bash
-python public_funds_simulator.py          # opens the graphical interface
-python public_funds_simulator.py --test   # runs all experiments in the terminal
+python public_funds_simulator.py                         # opens the window
+python public_funds_simulator.py --test                  # the 12 scripted demonstrations
+python public_funds_simulator.py --campaign              # the systematic test
+python public_funds_simulator.py --campaign --seed 7 --trials 500
 ```
-
-On Ubuntu/Debian, if the window won't open: `sudo apt install python3-tk`.
 
 ---
 
-## A guided tour (about 10 minutes)
+## A guided tour (about 15 minutes)
 
 | Tab | What to do there |
 |---|---|
-| **1. Start Here** | Read the two-minute explainer of every term used. |
-| **2. Project Overview** | See the headline numbers and four automatic checks (integrity, documents, checkpoint, unexplained gap). |
-| **3. Follow the Money** | Pick *Ubuntu Infrastructure* and see what the contractor received, passed on, and has no recorded use for. |
-| **4. Fingerprint Lab** | Type a sentence and watch its hash. Then try four ways of cheating on the ledger. |
-| **5. Compare Copies** | After cheating in tab 4, see how the other copies and the checkpoint expose it. |
-| **6. Experiments** | Click any of the 12 tests to read what it did and what it means. |
-
-The **"Viewing ledger copy"** dropdown (top right) chooses which of the three copies you are looking at and attacking. **Reset all copies** puts everything back.
+| **1. Start** | Read the two-minute explainer of every term used. |
+| **2. Overview** | Headline numbers and four automatic checks. |
+| **3. Money Trail** | Pick *Ubuntu Infrastructure* and see what the contractor received, passed on, and has no recorded use for. |
+| **4. Fingerprints** | Type a sentence and watch its hash. Then try four ways of cheating on the ledger. |
+| **5. Compare** | See how the other copies and the checkpoint expose a cheat. |
+| **6. Demonstrations** | Twelve short scripted tests. Click a row to read it in plain language. |
+| **7. Systematic Test** | Press Run. Thousands of random attacks go through five detectors; ten pre-registered hypotheses are judged by a fixed rule. |
 
 ---
 
-## The experiments, explained
+## Two kinds of experiment, and why both
 
-Think of the ledger as a **notebook of seven pages**, each with a fingerprint stamped on it that also depends on the page before. Each experiment is an attempt to tamper with a *temporary photocopy* of that notebook, then asking: did anyone notice?
+**Demonstrations (E1 to E12, tab 6).** We wrote each scenario by hand. They are good at *explaining* a mechanism ("change an amount and leave the old stamp: caught") but they are chosen by us, so they cannot prove how often a safeguard works.
 
-Every test is labelled **Strength** (the ledger caught it), **Limitation** (the ledger could not catch it alone), or **Context/Baseline**. A **YES** under "matched expectation" only means the result was what we *predicted*. On a Limitation row, a YES means the weakness is real, not that the system succeeded.
+**Systematic test (tab 7).** A seeded random generator chooses *which* block, *which* amount and *which* party. It runs every attack many times, at five attacker skill levels, through five independent detectors, and judges ten hypotheses by a rule fixed in advance. Some hypotheses were predicted to fail.
 
-### Part 1: Can it catch edits?
+### The threat model (all in the code, open to challenge)
 
-| Test | What we did | Result | What it means |
-|---|---|---|---|
-| **E1 Baseline** | Checked the untouched ledger. | Valid | The starting point. If this failed, every later failure could be a bug rather than our tampering. |
-| **E2 Careless edit** | Changed the first payment from R50m to R150m and left its fingerprint alone. | **Caught** (stored hash mismatch at block 2) | The old fingerprint no longer fits the new contents. Like changing a cheque amount but leaving the old stamp. |
-| **E3 Careful rewrite** | Made the same change, then recalculated *every* fingerprint in the chain. | **Not caught** (passes its own check) | Someone who controls a whole copy can redo all the stamps. Hashes alone do not stop an insider. |
-| **E4 Compare copies** | Compared that rewritten copy with an untouched one. | **Caught** (disagreement at block 2) | The cheat only shows up because an independent copy exists. Comparison says the copies *disagree*, not which is right. |
-
-**The lesson of E2 to E4:** the hashing is not what protects you. *Independent copies* are.
-
-### Part 2: Can it catch deletion?
-
-| Test | What we did | Result | What it means |
-|---|---|---|---|
-| **E5 Delete last two blocks** | Removed the final two entries and checked the shorter chain alone. | **Not caught** | A shorter chain is still perfectly self-consistent. Nothing inside it says pages are missing. |
-| **E6 Compare to full copy** | Compared the shortened chain with the complete one. | **Caught** (5 vs 7 blocks) | Another copy reveals what is missing. |
-| **E11 Published checkpoint** | Checked both the shortened chain (E5) and rewritten chain (E3) against a published block count and hash, with **no second copy**. | **Both caught** | A single public checkpoint exposes tampering that internal checks missed. It only works if the checkpoint sits somewhere the ledger keeper can't edit. |
-
-### Part 3: Can it tell if a transaction is *true*?
-
-| Test | What we did | Result | What it means |
-|---|---|---|---|
-| **E7 Unsupported payment** | Added a R40m payment to an unknown recipient with no supporting document. | **Not caught** | The hashes are consistent, so the integrity check passes. Valid does not mean honest or authorised. |
-| **E9 Altered document** | Edited a stored payment certificate, then re-checked it against the fingerprint recorded on the ledger. | **Caught** | Only fingerprints of documents go on the ledger, not the documents. A later change to a document no longer matches. Caveat: a *false* document recorded correctly would still pass. |
-
-### Part 4: Can rules and flags help?
-
-| Test | What we did | Result | What it means |
-|---|---|---|---|
-| **E8 Allocation vs award** | Subtracted the R480m award from the R500m budget. | R20m difference | The ledger exposes the number but does not interpret it. It is not proof of theft. |
-| **E12 Automatic gap flag** | Ran a rule that flags allocated money that is neither awarded nor explained. | **R20m flagged** | The gap no longer depends on a reader noticing it. It still cannot say *why*, and a normal database could run the same rule. |
-| **E10 Payment rule at entry** | Proposed a R400m payment (breaks the R480m award) and a R40m payment to an unverified recipient (stays inside it). | **R400m rejected, R40m accepted** | A rule can stop overspending *before* it is recorded. It cannot catch fraud that stays inside the limit. Rules only catch what they were written to catch. |
-
-### What the experiments add up to
-
-| The ledger is good at | The ledger cannot do alone |
+| Attack | What the attacker does |
 |---|---|
-| Detecting careless edits | Stopping someone who controls a whole copy |
-| Exposing disagreement between independent copies | Saying which copy is correct |
-| Detecting changed supporting documents | Proving a document was truthful |
-| Stopping rule-breaking before it is recorded | Catching dishonest entries that obey the rules |
-| Exposing and flagging gaps | Explaining why a gap exists |
+| A1 | Edits an amount |
+| A2 | Redirects a transaction to another party |
+| A3 | Edits a purpose description |
+| A4 | Deletes a block from the middle |
+| A5 | Truncates the final 1 or 2 blocks |
+| A6 | Appends an unsupported payment to one copy |
+| A7 | Swaps two blocks |
+| A8 | Alters a supporting document |
+| A9 | **Insider fraud:** a plausible, documented payment to the real contractor, within the award limit, entered through the normal process into *every* copy |
 
-In short, the experiments separate **integrity** (*was it changed?*) from **legitimacy** (*was it true or authorised?*). Blockchain-style tools help with the first. The second still needs people, governance, audits and evidence.
+| Attacker level | What they can also do |
+|---|---|
+| C0 | Naive: edits the data only |
+| C1 | Re-stamps the block they edited |
+| C2 | Rewrites the whole local chain |
+| C3 | C2, and repairs the document hashes |
+| C4 | Also controls every copy, the checkpoint and the documents |
+
+| Detector | What it checks |
+|---|---|
+| D1 | Internal hash check (recalculate every hash and link) |
+| D2 | Compare with an honest copy |
+| D3 | Published checkpoint |
+| D4 | Supporting-document hash check |
+| D5 | Audit rules that need no reference copy (allowed money routes, no party spends more than it received, payments within the award, every transaction has a document hash) |
+
+### How the test stays objective
+
+- **Randomised, seeded, repeatable.** Same seed, same numbers. Results were checked across five seeds.
+- **Control run.** With no attack, no detector may fire. If one does, the test reports FAIL and the numbers cannot be trusted. Every attack is also checked to have really changed something.
+- **Pre-registered hypotheses.** Each has a threshold and a prediction written in the code before the first run.
+- **Fixed verdict rule.** A hypothesis is SUPPORTED only if the whole 95% Wilson confidence interval sits on the claimed side of its threshold, REFUTED only if it sits wholly on the other side, otherwise INCONCLUSIVE.
+- **A fair rival.** The plain database gets every defence that does not need hashes: independent copies, a published digest of its rows, a document-hash column and the same audit rules. The only thing it lacks is the hash chain's internal check (D1).
+
+### Results (seed 2026, 200 trials per attack per level, 9,000 attacks)
+
+| ID | Hypothesis | Measured | Verdict |
+|---|---|---|---|
+| H1 | The internal hash check catches naive in-place edits | 100% | Supported |
+| H2 | The internal hash check is blind to a full local rewrite | 0% | Supported |
+| H3 | Honest copies or a checkpoint catch a full local rewrite | 100% | Supported |
+| H4 | The internal hash check misses truncation at every attacker level | 0% | Supported |
+| H5 | Audit rules catch an unsupported appended payment, even when copies and checkpoint are controlled | 100% | Supported |
+| H6 | A plausible fraudulent payment entered through the normal process is flagged by no detector | 0% | Supported |
+| H7 | An attacker who controls every copy, the checkpoint and the documents evades D1 to D4 | 0% | Supported |
+| H8 | Audit rules alone catch random amount edits | 14.5% | **Refuted** (predicted) |
+| H9 | With a single copy, the hash chain beats a plain database by 10 or more percentage points | +15.8 pp | Supported |
+| H10 | With copies and a checkpoint, the hash chain beats a plain database by 10 or more percentage points | +0.0 pp | **Refuted** (predicted) |
+
+### What the numbers say
+
+1. **H1 to H7 follow largely from how hashing works.** Their value is in confirming the harness behaves correctly and in giving exact detection rates per attack.
+2. **A careful insider defeats every integrity detector (H6, H7).** Integrity is not truth. This is the central limit of the technology.
+3. **H9 versus H10 is the contribution of the hash chain.** On a single copy it adds about 16 percentage points of detection (it makes naive edits self-evident). Once independent copies and a published checkpoint exist, a plain database detects exactly as much. The protection comes from *independent copies and publication*, not from hashing alone.
+4. **Audit rules (D5) are uneven (H8).** They reliably flag redirected money and unsupported payments, but flag only about 1 in 7 amount edits and no purpose edits.
+5. **A C1 attacker is caught about 85% of the time on edits, not 100%.** Re-stamping a block breaks the link to the next block, unless the edited block is the last one. This was not scripted; it emerged from the random positions.
+
+---
+
+## The twelve scripted demonstrations (E1 to E12)
+
+| Test | What it shows |
+|---|---|
+| E1 Baseline | The untouched ledger is valid (the starting point). |
+| E2 Careless edit | Changing an amount without re-stamping is caught. |
+| E3 Careful rewrite | Re-stamping the whole chain makes it pass its own check. |
+| E4 Compare copies | An untouched copy exposes the rewrite, but cannot say which is right. |
+| E5 Delete last two blocks | A shortened chain still passes its own check. |
+| E6 Compare to full copy | Another copy reveals the missing blocks. |
+| E7 Unsupported payment | A payment with no document passes integrity, which is not truth. |
+| E8 Allocation vs award | The R20m difference is visible but unexplained. |
+| E9 Altered document | A changed document no longer matches its recorded hash. |
+| E10 Payment rule at entry | A rule stops the overspend, not a fraud inside the limit. |
+| E11 Published checkpoint | A checkpoint catches the rewrite and the truncation with no second copy. |
+| E12 Automatic gap flag | The R20m gap is flagged without a reader noticing it. |
 
 ---
 
 ## What this project does *not* do
 
-- No real network, no consensus protocol, no voting between copies.
+- No real network, consensus or voting between copies.
 - No identity checks or digital signatures; the system design proposes these but the simulator does not implement them.
-- No privacy controls and no performance testing at scale.
-- Seven blocks of fictional data, each test run once on a fixed dataset.
-- Not a comparison against a conventional ledger database, though E10 and E12 note that a normal database could run the same rules.
+- The threat model is ours. A different set of attacks, attacker levels or detectors could give different numbers.
+- Seven blocks of fictional data; no performance testing at scale.
+- Giving the plain database a published digest is itself a use of hashing. That is deliberate (it is what makes the comparison fair), and it is why the two systems tie in H10.
 - Nothing here is financial, legal or auditing advice, and it does **not** prove that blockchain would reduce corruption.
 
 ---
@@ -148,11 +177,11 @@ In short, the experiments separate **integrity** (*was it changed?*) from **legi
 ## Repository layout
 
 ```
-public_funds_simulator.py   # the whole simulator: logic, experiments and GUI
+public_funds_simulator.py   # logic, demonstrations, systematic test and GUI
 README.md                   # this file
 ```
 
-Inside the script: hashing and chain logic (section 2), the fictional transactions (3), financial summaries (4), evidence checks and payment rule (5), the 12 experiments (6), plain-language content (7) and the Tkinter interface (8).
+Inside the script: hashing and chain logic (section 2), the fictional transactions (3), financial summaries (4), evidence checks and payment rule (5), the 12 demonstrations (6), the systematic attack campaign (6b), plain-language content (7) and the Tkinter interface (8).
 
 ---
 

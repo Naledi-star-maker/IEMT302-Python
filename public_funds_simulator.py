@@ -1,5 +1,5 @@
 """
-PUBLIC FUNDS TRANSPARENCY SIMULATOR  (v2, redesigned)
+PUBLIC FUNDS TRANSPARENCY SIMULATOR  (v4: systematic attack campaign)
 IEMT302 Emerging Technology Research Experiment
 
 All entities and transactions are fictional.
@@ -16,14 +16,19 @@ Requirements:
 
 Usage:
     python public_funds_simulator.py           opens the graphical interface
-    python public_funds_simulator.py --test    runs all experiments in the
-                                               terminal (no window needed)
+    python public_funds_simulator.py --test    runs the 12 scripted
+                                               demonstrations in the terminal
+    python public_funds_simulator.py --campaign [--seed N] [--trials N]
+                                               runs the systematic attack
+                                               campaign in the terminal
 """
 
 import copy
 import csv
 import hashlib
 import json
+import math
+import random
 import sys
 
 from datetime import datetime, timezone
@@ -773,6 +778,576 @@ def run_experiments():
     return results
 
 
+# ============================================================
+# 6b. SYSTEMATIC ATTACK CAMPAIGN (OBJECTIVE TESTING)
+# ============================================================
+#
+# The scripted experiments above are demonstrations: WE chose each
+# scenario. This campaign removes that choice. A seeded random generator
+# builds thousands of attacks, every attack is run against five
+# independent detectors, and each hypothesis is judged by a fixed rule
+# (a Wilson confidence interval against a threshold) that was written
+# BEFORE the results were seen. A hash-chain ledger is compared with a
+# plain database that has no hashes, using exactly the same attacks.
+
+CAMPAIGN_SEED = 2026
+CAMPAIGN_TRIALS = 200
+
+ATTACKS = {
+    "A1": "Edit an amount",
+    "A2": "Redirect a transaction to another party",
+    "A3": "Edit a purpose description",
+    "A4": "Delete a block from the middle",
+    "A5": "Truncate the final 1 or 2 blocks",
+    "A6": "Append an unsupported payment (one copy only)",
+    "A7": "Swap two blocks",
+    "A8": "Alter a supporting document",
+    "A9": "Insider fraud via the normal process",
+}
+
+CAPABILITIES = {
+    "C0": "Naive: edits the data only",
+    "C1": "Re-stamps the block it edited",
+    "C2": "Rewrites the whole local chain",
+    "C3": "C2 and repairs the document hashes",
+    "C4": "Also controls all copies and the checkpoint",
+}
+
+DETECTORS = {
+    "D1": "Internal hash check",
+    "D2": "Compare with an honest copy",
+    "D3": "Published checkpoint",
+    "D4": "Supporting-document hash check",
+    "D5": "Audit rules (need no reference copy)",
+}
+
+# Which detectors each system has. The plain database has no hashes, so
+# it has no D1, but it can still compare copies, publish a digest of its
+# rows (D2c, D3c), keep a document-hash column (D4) and run audit rules
+# (D5).
+SYSTEM_DETECTORS = {
+    "Hash chain, single copy": ["D1", "D4", "D5"],
+    "Plain database, single copy": ["D4", "D5"],
+    "Hash chain + copies + checkpoint": ["D1", "D2", "D3", "D4", "D5"],
+    "Plain database + copies + digest": ["D2c", "D3c", "D4", "D5"],
+}
+
+# Routes money may legitimately take in this project.
+ALLOWED_ROUTES = {
+    (TREASURY, DEPARTMENT, "ALLOCATION"),
+    (DEPARTMENT, CONTRACTOR, "TENDER_AWARD"),
+    (DEPARTMENT, CONTRACTOR, "PAYMENT"),
+    (CONTRACTOR, STEEL, "ONWARD_PAYMENT"),
+    (CONTRACTOR, LABOUR, "ONWARD_PAYMENT"),
+}
+
+# Hypotheses and predictions, fixed BEFORE the campaign was run.
+#   rate: the share of attacks flagged by ANY listed detector.
+#   diff: rate(set a) minus rate(set b), in percentage points.
+#   Verdict rule: SUPPORTED only if the whole 95% interval is on the
+#   claimed side of the threshold, REFUTED only if the whole interval is
+#   on the other side, otherwise INCONCLUSIVE.
+HYPOTHESES = [
+    {"id": "H1", "kind": "rate", "op": ">=", "threshold": 0.95,
+     "claim": "The internal hash check catches naive in-place edits.",
+     "attacks": ["A1", "A2", "A3"], "caps": ["C0"],
+     "detectors": ["D1"], "predicted": "SUPPORTED"},
+    {"id": "H2", "kind": "rate", "op": "<=", "threshold": 0.05,
+     "claim": "The internal hash check is blind to a full local rewrite.",
+     "attacks": ["A1", "A2", "A3"], "caps": ["C2"],
+     "detectors": ["D1"], "predicted": "SUPPORTED"},
+    {"id": "H3", "kind": "rate", "op": ">=", "threshold": 0.95,
+     "claim": "Honest copies or a checkpoint catch a full local rewrite.",
+     "attacks": ["A1", "A2", "A3", "A4", "A5", "A7"], "caps": ["C2"],
+     "detectors": ["D2", "D3"], "predicted": "SUPPORTED"},
+    {"id": "H4", "kind": "rate", "op": "<=", "threshold": 0.05,
+     "claim": "The internal hash check misses truncation at every "
+              "attacker level.",
+     "attacks": ["A5"], "caps": ["C0", "C1", "C2", "C3", "C4"],
+     "detectors": ["D1"], "predicted": "SUPPORTED"},
+    {"id": "H5", "kind": "rate", "op": ">=", "threshold": 0.95,
+     "claim": "Audit rules catch an unsupported appended payment even "
+              "when copies, checkpoint and documents are all controlled.",
+     "attacks": ["A6"], "caps": ["C4"],
+     "detectors": ["D5"], "predicted": "SUPPORTED"},
+    {"id": "H6", "kind": "rate", "op": "<=", "threshold": 0.05,
+     "claim": "A plausible fraudulent payment entered through the "
+              "normal process is flagged by no detector.",
+     "attacks": ["A9"], "caps": ["C0", "C1", "C2", "C3", "C4"],
+     "detectors": ["D1", "D2", "D3", "D4", "D5"],
+     "predicted": "SUPPORTED"},
+    {"id": "H7", "kind": "rate", "op": "<=", "threshold": 0.05,
+     "claim": "An attacker who controls every copy, the checkpoint and "
+              "the documents evades the integrity detectors D1 to D4.",
+     "attacks": ["A1", "A2", "A3", "A4", "A5", "A7", "A8"],
+     "caps": ["C4"], "detectors": ["D1", "D2", "D3", "D4"],
+     "predicted": "SUPPORTED"},
+    {"id": "H8", "kind": "rate", "op": ">=", "threshold": 0.95,
+     "claim": "Audit rules alone catch random amount edits.",
+     "attacks": ["A1"], "caps": ["C4"],
+     "detectors": ["D5"], "predicted": "REFUTED"},
+    {"id": "H9", "kind": "diff", "op": ">=", "threshold": 0.10,
+     "claim": "With a single copy, the hash chain detects at least 10 "
+              "percentage points more attacks than a plain database.",
+     "attacks": list(ATTACKS), "caps": list(CAPABILITIES),
+     "a": "Hash chain, single copy",
+     "b": "Plain database, single copy", "predicted": "SUPPORTED"},
+    {"id": "H10", "kind": "diff", "op": ">=", "threshold": 0.10,
+     "claim": "With independent copies and a checkpoint, the hash chain "
+              "detects at least 10 percentage points more attacks than "
+              "a plain database with a published digest.",
+     "attacks": list(ATTACKS), "caps": list(CAPABILITIES),
+     "a": "Hash chain + copies + checkpoint",
+     "b": "Plain database + copies + digest", "predicted": "REFUTED"},
+]
+
+
+def wilson(k, n, z=1.96):
+    """95% Wilson score interval for a proportion k/n."""
+    if n == 0:
+        return 0.0, 1.0
+
+    p = k / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def plain_rows(chain):
+    """What a plain database would hold: the rows, with no hashes."""
+    return [block["transaction"] for block in chain]
+
+
+def audit_ledger(chain):
+    """
+    Rule-based audit that needs no reference copy. Returns a list of
+    violations; an empty list means every rule passed.
+    """
+    problems = []
+
+    for block in chain:
+        tx = block["transaction"]
+        route = (tx["from"], tx["to"], tx["type"])
+
+        if route not in ALLOWED_ROUTES:
+            problems.append(
+                f"Block {block['index']}: {tx['from']} -> {tx['to']} "
+                f"({tx['type']}) is not an allowed route."
+            )
+
+        if tx["amount"] <= 0:
+            problems.append(f"Block {block['index']}: amount not positive.")
+
+        if not tx.get("supporting_data_hash"):
+            problems.append(
+                f"Block {block['index']}: no supporting document hash."
+            )
+
+    for party in PARTIES:
+        got, sent = party_summary(chain, party)
+
+        if party != TREASURY and sent > got:
+            problems.append(
+                f"{party} sent {money(sent)} but received only "
+                f"{money(got)}."
+            )
+
+    if government_payments(chain) > award_amount(chain):
+        problems.append("Payments exceed the contract award.")
+
+    if award_amount(chain) > allocation_amount(chain):
+        problems.append("The award exceeds the allocation.")
+
+    return problems
+
+
+def apply_attack(attack, victim, honest, store, rng):
+    """
+    Carry out one randomly parameterised attack. Returns
+    (modified positions, altered document key or None).
+    """
+    modified = []
+    doc_key = None
+
+    if attack == "A1":
+        i = rng.choice([
+            n for n, b in enumerate(victim)
+            if b["transaction"]["amount"] > 0
+        ])
+        old = victim[i]["transaction"]["amount"]
+        new = old
+
+        while new == old:
+            new = max(1, int(old * rng.uniform(0.2, 3.0)))
+
+        victim[i]["transaction"]["amount"] = new
+        modified = [i]
+
+    elif attack == "A2":
+        i = rng.randrange(len(victim))
+        tx = victim[i]["transaction"]
+        tx["to"] = rng.choice([p for p in PARTIES if p != tx["to"]])
+        modified = [i]
+
+    elif attack == "A3":
+        i = rng.randrange(len(victim))
+        victim[i]["transaction"]["purpose"] = (
+            f"Edited purpose {rng.randint(1000, 9999)}"
+        )
+        modified = [i]
+
+    elif attack == "A4":
+        i = rng.randrange(1, len(victim) - 1)
+        del victim[i]
+        modified = [i]
+
+    elif attack == "A5":
+        del victim[-rng.choice([1, 2]):]
+
+    elif attack == "A6":
+        add_block(
+            victim,
+            transaction(
+                DEPARTMENT,
+                rng.choice(["Unverified Recipient (Fictional)", OTHER]),
+                rng.randint(1, 100) * 1_000_000,
+                "PAYMENT", "Unsupported payment",
+                "NO-INDEPENDENT-EVIDENCE",
+            ),
+            FIXED_TIME,
+        )
+
+    elif attack == "A7":
+        i, j = rng.sample(range(len(victim)), 2)
+        victim[i], victim[j] = victim[j], victim[i]
+        modified = [i, j]
+
+    elif attack == "A8":
+        doc_key = rng.choice(list(store))
+        store[doc_key] = f"ALTERED DOCUMENT {rng.randint(1000, 9999)}"
+
+    elif attack == "A9":
+        # A plausible, documented payment to the real contractor that
+        # stays inside the award. It goes through the normal process, so
+        # EVERY copy records it and the document is on file.
+        remaining = award_amount(victim) - government_payments(victim)
+        amount = rng.randint(1, remaining // 1_000_000) * 1_000_000
+        reference = f"PAYMENT-X{rng.randint(100, 999)}"
+        store[reference] = f"SIMULATED DOCUMENT: payment {reference}"
+
+        tx = transaction(
+            DEPARTMENT, CONTRACTOR, amount, "PAYMENT",
+            "Plausible but fraudulent payment", reference,
+        )
+        tx["supporting_data_hash"] = sha256(store[reference])
+
+        add_block(victim, tx, FIXED_TIME)
+        add_block(honest, tx, FIXED_TIME)
+
+    return modified, doc_key
+
+
+def apply_capability(cap, victim, store, modified, doc_key):
+    """Let the attacker cover their tracks as far as their level allows."""
+    if cap == "C1":
+        for i in modified:
+            if 0 <= i < len(victim):
+                victim[i]["hash"] = calculate_block_hash(victim[i])
+
+    elif cap in ("C2", "C3", "C4"):
+        if cap in ("C3", "C4") and doc_key:
+            for block in victim:
+                tx = block["transaction"]
+
+                if (
+                    tx["evidence_reference"] == doc_key
+                    and tx["supporting_data_hash"]
+                ):
+                    tx["supporting_data_hash"] = sha256(store[doc_key])
+
+        recalculate_chain(victim)
+
+
+def run_detectors(victim, honest, checkpoint, digest, store):
+    """Run every detector on the (possibly attacked) victim copy."""
+    n = checkpoint["blocks"]
+    rows = plain_rows(victim)
+
+    return {
+        "D1": not verify_chain(victim)[0],
+        "D2": not compare_chains(victim, honest)[0],
+        "D3": not check_against_checkpoint(victim, checkpoint)[0],
+        "D4": not evidence_ok(victim, store)[0],
+        "D5": len(audit_ledger(victim)) > 0,
+        "D2c": rows != plain_rows(honest),
+        "D3c": len(rows) < n
+        or sha256(canonical_json(rows[:n])) != digest,
+    }
+
+
+def run_campaign(seed=CAMPAIGN_SEED, trials=CAMPAIGN_TRIALS):
+    """Run every attack at every attacker level, `trials` times each."""
+    rng = random.Random(seed)
+    baseline = build_initial_ledger()
+    base_rows = plain_rows(baseline)
+
+    checkpoint = make_checkpoint(baseline)
+    digest = sha256(canonical_json(base_rows))
+
+    # Control: with no attack, no detector may fire. If one does, the
+    # test harness itself is broken and nothing below can be trusted.
+    control = run_detectors(
+        copy.deepcopy(baseline), copy.deepcopy(baseline), checkpoint,
+        digest, dict(EVIDENCE),
+    )
+    control_ok = not any(control.values())
+
+    log = []
+    ineffective = 0
+
+    for attack in ATTACKS:
+        for cap in CAPABILITIES:
+            for _ in range(trials):
+                victim = copy.deepcopy(baseline)
+                honest = copy.deepcopy(baseline)
+                store = dict(EVIDENCE)
+                cp = dict(checkpoint)
+                dg = digest
+
+                modified, doc_key = apply_attack(
+                    attack, victim, honest, store, rng
+                )
+                apply_capability(cap, victim, store, modified, doc_key)
+
+                # Check the attack really changed something.
+                if (
+                    plain_rows(victim) == base_rows
+                    and store == EVIDENCE
+                ):
+                    ineffective += 1
+
+                if cap == "C4":
+                    # The attacker also replaces every other copy and
+                    # re-publishes the checkpoint and digest.
+                    honest = copy.deepcopy(victim)
+                    cp = make_checkpoint(victim) if victim else cp
+                    dg = sha256(canonical_json(plain_rows(victim)))
+
+                result = run_detectors(victim, honest, cp, dg, store)
+                log.append({"attack": attack, "cap": cap, **result})
+
+    return {
+        "seed": seed,
+        "trials": trials,
+        "control": control,
+        "control_ok": control_ok,
+        "ineffective": ineffective,
+        "log": log,
+        "hypotheses": evaluate_hypotheses(log),
+    }
+
+
+def detection_count(log, attacks, caps, detectors):
+    """Return (flagged, total) over the chosen attacks and levels."""
+    rows = [r for r in log if r["attack"] in attacks and r["cap"] in caps]
+    flagged = sum(1 for r in rows if any(r[d] for d in detectors))
+    return flagged, len(rows)
+
+
+def evaluate_hypotheses(log):
+    """Apply each pre-registered verdict rule to the measured data."""
+    out = []
+
+    for h in HYPOTHESES:
+        if h["kind"] == "rate":
+            k, n = detection_count(log, h["attacks"], h["caps"],
+                                   h["detectors"])
+            value = k / n
+            low, high = wilson(k, n)
+            detail = f"{k}/{n}"
+        else:
+            ka, na = detection_count(log, h["attacks"], h["caps"],
+                                     SYSTEM_DETECTORS[h["a"]])
+            kb, nb = detection_count(log, h["attacks"], h["caps"],
+                                     SYSTEM_DETECTORS[h["b"]])
+            pa, pb = ka / na, kb / nb
+            value = pa - pb
+            spread = 1.96 * math.sqrt(
+                pa * (1 - pa) / na + pb * (1 - pb) / nb
+            )
+            low, high = value - spread, value + spread
+            detail = f"{pa:.1%} vs {pb:.1%}"
+
+        t = h["threshold"]
+
+        if h["op"] == ">=":
+            verdict = ("SUPPORTED" if low >= t
+                       else "REFUTED" if high < t else "INCONCLUSIVE")
+        else:
+            verdict = ("SUPPORTED" if high <= t
+                       else "REFUTED" if low > t else "INCONCLUSIVE")
+
+        out.append({
+            **h, "value": value, "low": low, "high": high,
+            "detail": detail, "verdict": verdict,
+            "prediction_correct": verdict == h["predicted"],
+        })
+
+    return out
+
+
+def campaign_rows(result):
+    """Flat rows (for CSV): detection counts per attack, level, detector."""
+    rows = []
+    log = result["log"]
+
+    for attack in ATTACKS:
+        for cap in CAPABILITIES:
+            for det in ["D1", "D2", "D3", "D4", "D5", "D2c", "D3c"]:
+                k, n = detection_count(log, [attack], [cap], [det])
+                rows.append({
+                    "attack": attack, "attack_name": ATTACKS[attack],
+                    "capability": cap,
+                    "capability_name": CAPABILITIES[cap],
+                    "detector": det, "flagged": k, "trials": n,
+                    "rate": round(k / n, 4),
+                })
+
+    return rows
+
+
+def format_campaign(result):
+    """Turn campaign results into (text, tag) segments for display."""
+    log = result["log"]
+    total = len(log)
+
+    def pct(k, n):
+        return f"{100 * k / n:5.1f}%"
+
+    segs = [
+        ("Systematic attack campaign\n", "h1"),
+        (f"Seed {result['seed']}  |  {result['trials']} random trials per "
+         f"attack per attacker level  |  {total} attacks in total. Same "
+         "seed, same results.\n", "note"),
+
+        ("\nCONTROL (no attack)\n", "h2"),
+    ]
+
+    if result["control_ok"] and result["ineffective"] == 0:
+        segs.append((
+            "PASS  With no attack, no detector fired, and every attack "
+            "really changed the data. The harness is sound.\n", "ok"))
+    else:
+        segs.append((
+            "FAIL  A detector fired with no attack, or an attack changed "
+            "nothing. Do not trust the numbers below.\n", "bad"))
+
+    segs.append(("\nHYPOTHESES (predictions were fixed before running)\n",
+                 "h2"))
+
+    for h in result["hypotheses"]:
+        sign = "at least" if h["op"] == ">=" else "at most"
+        unit = ("percentage points" if h["kind"] == "diff" else "")
+        thr = (f"{h['threshold'] * 100:.0f} {unit}" if unit
+               else f"{h['threshold']:.0%}")
+        measured = (f"{h['value'] * 100:+.1f} percentage points"
+                    if h["kind"] == "diff" else f"{h['value']:.1%}")
+        ci_lo, ci_hi = h["low"], h["high"]
+        ci = (f"{ci_lo * 100:.1f} to {ci_hi * 100:.1f}"
+              if h["kind"] == "diff"
+              else f"{ci_lo:.1%} to {ci_hi:.1%}")
+
+        segs += [
+            (f"{h['id']}  {h['claim']}\n", "key"),
+            (f"    Needs {sign} {thr}.  Measured {measured} "
+             f"({h['detail']}), 95% interval {ci}.\n", "mono"),
+            ("    Predicted: ", ""),
+            (h["predicted"], "key"),
+            ("   Verdict: ", ""),
+            (h["verdict"],
+             "ok" if h["verdict"] == "SUPPORTED"
+             else "bad"),
+            ("   Prediction correct: ", ""),
+            ("YES\n" if h["prediction_correct"] else "NO\n",
+             "ok" if h["prediction_correct"] else "bad"),
+        ]
+
+    segs.append(("\nDETECTION RATE BY ATTACK, DETECTOR AND ATTACKER "
+                 "LEVEL\n", "h2"))
+    segs.append((
+        "Each cell is the share of that attack flagged by that detector. "
+        "Read across a row to see which detectors notice it.\n", "note"))
+
+    cols = ["D1", "D2", "D3", "D4", "D5"]
+
+    for cap, cap_name in CAPABILITIES.items():
+        table = [f"\n{cap}: {cap_name}\n",
+                 "  " + f"{'Attack':<52}" + "".join(
+                     f"{c:>8}" for c in cols) + f"{'Any':>8}\n"]
+
+        for attack, name in ATTACKS.items():
+            counts = [detection_count(log, [attack], [cap], [c])
+                      for c in cols]
+            any_k, any_n = detection_count(log, [attack], [cap], cols)
+            table.append(
+                f"  {attack + ' ' + name:<52}"
+                + "".join(f"{pct(k, n):>8}" for k, n in counts)
+                + f"{pct(any_k, any_n):>8}\n"
+            )
+
+        segs.append(("".join(table), "mono"))
+
+    segs.append(("\n\nDETECTORS\n", "h2"))
+    segs.append(("\n".join(
+        f"  {k}  {v}" for k, v in DETECTORS.items()
+    ) + "\n", "mono"))
+
+    segs.append(("\nHASH CHAIN VERSUS PLAIN DATABASE (same attacks)\n",
+                 "h2"))
+    segs.append((
+        "Share of all attacks (A1 to A9) flagged by any detector the "
+        "system has.\n", "note"))
+
+    header = "  " + f"{'Attacker level':<54}" + "".join(
+        f"{i + 1:>9}" for i in range(len(SYSTEM_DETECTORS))) + "\n"
+    names = [f"  ({i + 1}) {n}\n"
+             for i, n in enumerate(SYSTEM_DETECTORS)]
+
+    lines = [header]
+
+    for cap, cap_name in list(CAPABILITIES.items()) + [("ALL", "All levels")]:
+        caps = list(CAPABILITIES) if cap == "ALL" else [cap]
+        cells = []
+
+        for dets in SYSTEM_DETECTORS.values():
+            k, n = detection_count(log, list(ATTACKS), caps, dets)
+            cells.append(f"{pct(k, n):>9}")
+
+        lines.append(f"  {cap + ' ' + cap_name:<54}" + "".join(cells) + "\n")
+
+    segs.append(("".join(names) + "\n" + "".join(lines), "mono"))
+
+    segs.append((
+        "\nHOW TO READ THIS FAIRLY\n", "h2"))
+    segs.append((
+        "- The attack types, attacker levels and detectors are OUR model "
+        "of a threat. A different model could give different numbers. "
+        "The model is listed in full above so it can be challenged.\n"
+        "- The random generator chooses WHICH block, WHICH amount and "
+        "WHICH party. We do not choose cases that flatter the ledger.\n"
+        "- The plain database is given every defence that does not need "
+        "hashes: copies, a published digest, a document-hash column and "
+        "the same audit rules.\n"
+        "- A level C4 attacker (every copy, the checkpoint and the "
+        "documents) or an insider using the normal process (A9) defeats "
+        "every integrity detector. Detection then rests on audit rules "
+        "and on people.\n", "callout"))
+
+    return segs
+
+
 def run_cli_tests():
     """Run all experiments in the terminal and exit."""
     results = run_experiments()
@@ -795,6 +1370,23 @@ def run_cli_tests():
     print(f"{matched} of {len(results)} experiments matched expectations.")
 
     sys.exit(0 if matched == len(results) else 1)
+
+
+def run_cli_campaign(argv):
+    """Run the systematic campaign in the terminal and exit."""
+    def option(name, default):
+        if name in argv:
+            return int(argv[argv.index(name) + 1])
+        return default
+
+    result = run_campaign(
+        option("--seed", CAMPAIGN_SEED),
+        option("--trials", CAMPAIGN_TRIALS),
+    )
+
+    print("".join(text for text, _ in format_campaign(result)))
+
+    sys.exit(0 if result["control_ok"] else 1)
 
 
 # ============================================================
@@ -863,18 +1455,20 @@ def start_here_segments():
          "use of government money, not extra government spending.\n\n",
          ""),
 
-        ("5. A 10 MINUTE TOUR\n", "h2"),
-        ("Tab 2  Project Overview: the headline numbers and automatic "
-         "checks.\n"
-         "Tab 3  Follow the Money: a picture of where every rand went, "
+        ("5. A 15 MINUTE TOUR\n", "h2"),
+        ("Tab 2  Overview: the headline numbers and automatic checks.\n"
+         "Tab 3  Money Trail: a picture of where every rand went, "
          "including what the contractor received and passed on.\n"
-         "Tab 4  Fingerprint Lab: type a sentence and watch its "
+         "Tab 4  Fingerprints: type a sentence and watch its "
          "fingerprint, then try to cheat by editing the ledger.\n"
-         "Tab 5  Compare Copies: see how the three record keepers and a "
+         "Tab 5  Compare: see how the three record keepers and a "
          "published checkpoint expose a cheat.\n"
-         f"Tab 6  Experiments: {n} repeatable tests, each explained in "
-         "plain language, showing what the system can and cannot "
-         "catch.\n\n", ""),
+         f"Tab 6  Demonstrations: {n} short scripted tests that show "
+         "HOW each safeguard works. We chose these cases ourselves.\n"
+         "Tab 7  Systematic Test: thousands of random attacks run "
+         "through five independent detectors, with predictions fixed in "
+         "advance and a plain database as a fair comparison. This is "
+         "the objective test.\n\n", ""),
 
         ("6. THE SINGLE MOST IMPORTANT LIMIT\n", "h2"),
         ("A ledger can show that a record was ", ""),
@@ -910,7 +1504,7 @@ WELCOME_TEXT = [
      "does not prove that blockchain would stop corruption.\n\n", ""),
 
     ("PASS means no change was detected. FAIL means a change was "
-     "detected. Begin on the \"1. Start Here\" tab.\n", "key"),
+     "detected. Begin on the \"1. Start\" tab.\n", "key"),
 ]
 
 
@@ -1042,12 +1636,13 @@ def write(widget, segments):
 class PublicFundsApp:
 
     TAB_NAMES = [
-        "1. Start Here",
-        "2. Project Overview",
-        "3. Follow the Money",
-        "4. Fingerprint Lab",
-        "5. Compare Copies",
-        "6. Experiments",
+        "1. Start",
+        "2. Overview",
+        "3. Money Trail",
+        "4. Fingerprints",
+        "5. Compare",
+        "6. Demonstrations",
+        "7. Systematic Test",
     ]
 
     def __init__(self, root):
@@ -1060,6 +1655,7 @@ class PublicFundsApp:
         self.copies = make_copies()
         self.checkpoint = make_checkpoint(self.copies[COPY_NAMES[0]])
         self.experiment_results = []
+        self.campaign_result = None
 
         self.selected_copy = tk.StringVar(value=COPY_NAMES[0])
         self.selected_party = tk.StringVar(value=CONTRACTOR)
@@ -1114,7 +1710,7 @@ class PublicFundsApp:
         style.configure("TNotebook", background=BG_PINK, borderwidth=0)
         style.configure(
             "TNotebook.Tab", background=PINK_MID, foreground=BLACK,
-            padding=(14, 8), font=bold,
+            padding=(10, 8), font=bold,
         )
         style.map(
             "TNotebook.Tab",
@@ -1280,6 +1876,7 @@ class PublicFundsApp:
         self.build_hash_lab()
         self.build_compare()
         self.build_experiments()
+        self.build_campaign()
 
         self.status = tk.StringVar(value="")
 
@@ -1355,7 +1952,7 @@ class PublicFundsApp:
         ).pack(side="left")
 
         ttk.Button(
-            bar, text="Next: Follow the Money  >",
+            bar, text="Next: Money Trail  >",
             command=lambda: self.go_to_tab(2),
         ).pack(side="right")
 
@@ -1464,7 +2061,7 @@ class PublicFundsApp:
 
         self.money_text = self.make_text(tab, height=10)
 
-        self.next_button(tab, "Next: Fingerprint Lab  >", 3)
+        self.next_button(tab, "Next: Fingerprints  >", 3)
 
     def draw_flow(self):
         c = self.flow_canvas
@@ -2002,7 +2599,7 @@ class PublicFundsApp:
 
         self.compare_text = self.make_text(tab, height=14)
 
-        self.next_button(tab, "Next: Experiments  >", 5)
+        self.next_button(tab, "Next: Demonstrations  >", 5)
 
     def compare_segments(self):
         cp = self.checkpoint
@@ -2087,12 +2684,13 @@ class PublicFundsApp:
         tab = self.tab_frames[5]
 
         self.page(
-            tab, "Experiments",
-            "Repeatable tests run on temporary copies, so they never "
-            "change the live ledger. Click any row to read it in plain "
-            "language. 'Shows' tells you whether a test reveals a "
-            "STRENGTH or a LIMITATION. A YES on a limitation row means "
-            "the weakness is real, not that the system succeeded.",
+            tab, "Demonstrations (scripted, chosen by us)",
+            "Twelve short tests that show HOW each safeguard works. We "
+            "picked every case ourselves, so treat them as explanations, "
+            "not proof; tab 7 is the unbiased test. They run on "
+            "temporary copies and never change the live ledger. Click a "
+            "row to read it. A YES on a Limitation row means the "
+            "weakness is real, not that the system succeeded.",
         )
 
         bar = ttk.Frame(tab)
@@ -2110,10 +2708,18 @@ class PublicFundsApp:
 
         columns = ("test", "matches_expectation", "shows")
 
+        tree_frame = ttk.Frame(tab)
+        tree_frame.pack(fill="x", pady=4)
+
         self.results_tree = ttk.Treeview(
-            tab, columns=columns, show="headings", height=7,
+            tree_frame, columns=columns, show="headings", height=7,
             selectmode="browse",
         )
+
+        tree_scroll = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.results_tree.yview
+        )
+        self.results_tree.configure(yscrollcommand=tree_scroll.set)
 
         for col, label, width, anchor in [
             ("test", "Test", 420, "w"),
@@ -2128,7 +2734,8 @@ class PublicFundsApp:
         self.results_tree.tag_configure("Baseline", background=PINK_SOFT)
         self.results_tree.tag_configure("Context", background=PINK_SOFT)
 
-        self.results_tree.pack(fill="x", pady=4)
+        self.results_tree.pack(side="left", fill="x", expand=True)
+        tree_scroll.pack(side="right", fill="y")
         self.results_tree.bind(
             "<<TreeviewSelect>>", lambda _e: self.show_result_detail()
         )
@@ -2141,6 +2748,8 @@ class PublicFundsApp:
             fg=BLACK, anchor="w", justify="left", wraplength=1100,
             padx=10, pady=8, font=("TkDefaultFont", 10),
         ).pack(fill="x", pady=(4, 0))
+
+        self.next_button(tab, "Next: Systematic Test  >", 6)
 
     def refresh_experiments(self):
         self.experiment_results = run_experiments()
@@ -2256,6 +2865,125 @@ class PublicFundsApp:
             messagebox.showerror("Export Failed", str(exc))
 
     # --------------------------------------------------------
+    # Tab 7: Systematic test
+    # --------------------------------------------------------
+
+    def build_campaign(self):
+        tab = self.tab_frames[6]
+
+        self.page(
+            tab, "Systematic test (random, repeatable, pre-registered)",
+            "A program, not a person, picks the attacks. It runs nine "
+            "kinds of attack at five attacker skill levels, each many "
+            "times with random targets, through five independent "
+            "detectors, and compares the hash chain with a plain "
+            "database. Ten hypotheses were written down BEFORE the run, "
+            "and some are predicted to fail. Press Run.",
+        )
+
+        controls = ttk.Frame(tab)
+        controls.pack(fill="x", pady=(0, 6))
+
+        self.seed_var = tk.StringVar(value=str(CAMPAIGN_SEED))
+        self.trials_var = tk.StringVar(value=str(CAMPAIGN_TRIALS))
+
+        ttk.Label(controls, text="Random seed:").pack(side="left")
+        ttk.Entry(
+            controls, textvariable=self.seed_var, width=8
+        ).pack(side="left", padx=(4, 12))
+
+        ttk.Label(controls, text="Trials per cell:").pack(side="left")
+        ttk.Entry(
+            controls, textvariable=self.trials_var, width=6
+        ).pack(side="left", padx=(4, 12))
+
+        ttk.Button(
+            controls, text="Run systematic test",
+            command=self.run_campaign_gui,
+        ).pack(side="left", padx=(0, 6))
+
+        ttk.Button(
+            controls, text="Export results to CSV",
+            command=self.export_campaign,
+        ).pack(side="left")
+
+        self.campaign_summary = tk.StringVar(
+            value="Not run yet. Press \"Run systematic test\"."
+        )
+
+        tk.Label(
+            tab, textvariable=self.campaign_summary, bg=PINK_MID,
+            fg=BLACK, anchor="w", justify="left", wraplength=1100,
+            padx=10, pady=8, font=("TkDefaultFont", 10, "bold"),
+        ).pack(fill="x", pady=(0, 4))
+
+        self.campaign_text = self.make_text(tab, height=20)
+
+    def run_campaign_gui(self):
+        try:
+            seed = int(self.seed_var.get())
+            trials = int(self.trials_var.get())
+
+            if trials < 1 or trials > 2000:
+                raise ValueError("Trials must be between 1 and 2000.")
+        except ValueError as exc:
+            messagebox.showwarning("Invalid Input", str(exc))
+            return
+
+        self.status.set("Running thousands of random attacks...")
+        self.root.update_idletasks()
+
+        self.campaign_result = run_campaign(seed, trials)
+        result = self.campaign_result
+
+        write(self.campaign_text, format_campaign(result))
+
+        hyps = result["hypotheses"]
+        supported = sum(1 for h in hyps if h["verdict"] == "SUPPORTED")
+        refuted = sum(1 for h in hyps if h["verdict"] == "REFUTED")
+        correct = sum(1 for h in hyps if h["prediction_correct"])
+
+        self.campaign_summary.set(
+            f"{len(result['log'])} attacks run. Hypotheses: {supported} "
+            f"supported, {refuted} refuted, "
+            f"{len(hyps) - supported - refuted} inconclusive. Our "
+            f"predictions were right for {correct} of {len(hyps)}. "
+            f"Control: {'PASS' if result['control_ok'] else 'FAIL'}."
+        )
+        self.status.set("Systematic test finished.")
+
+    def export_campaign(self):
+        if not self.campaign_result:
+            messagebox.showinfo(
+                "No Results", "Run the systematic test before exporting."
+            )
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Export Systematic Test Results",
+            defaultextension=".csv",
+            initialfile="systematic_test_results.csv",
+            filetypes=[("CSV files", "*.csv")],
+        )
+
+        if not path:
+            return
+
+        try:
+            rows = campaign_rows(self.campaign_result)
+
+            with open(path, "w", newline="", encoding="utf-8") as file:
+                writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+
+            messagebox.showinfo(
+                "Export Complete", f"Results saved to:\n{path}"
+            )
+        except OSError as exc:
+            messagebox.showerror("Export Failed", str(exc))
+
+    # --------------------------------------------------------
     # Refresh and reset
     # --------------------------------------------------------
 
@@ -2295,6 +3023,9 @@ class PublicFundsApp:
 if __name__ == "__main__":
     if "--test" in sys.argv:
         run_cli_tests()
+
+    if "--campaign" in sys.argv:
+        run_cli_campaign(sys.argv)
 
     if tk is None:
         print("Tkinter is not installed. Use --test to run the experiments "
